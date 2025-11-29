@@ -1,393 +1,515 @@
+# ===== Standard library =====
 import math
+from typing import Optional
+
+# ===== Third-party =====
 import torch
-
+from torch import autograd
 from torch import nn
-from tqdm.auto import tqdm
+import torch.nn.functional as F
 from torch_geometric.data import Batch
+from uff_torch import UFFTorch, build_uff_inputs, merge_uff_inputs
 
-from ..encoder import EGNN, MLPEdgeEncoder
-from ..common import extend_graph_order_radius, extend_to_cross_attention
+# ===== Local (project) =====
+from ..encoder.egnn import EGNN
+from ..encoder.edge import MLPEdgeEncoder
+from ..encoder.cross_attention import CrossGraphAligner
+from ..common import extend_graph_order_radius
 
 
-def get_distance(pos, edge_index):
+# ---------------- Schedules ----------------
+
+def linear_beta_schedule(num_timesteps: int, beta_start: float = 1e-4, beta_end: float = 0.02) -> torch.Tensor:
+    return torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
+
+def cosine_beta_schedule(num_timesteps: int, s: float = 0.008) -> torch.Tensor:
+    """
+    Nichol & Dhariwal (2021): https://arxiv.org/abs/2102.09672
+    Returns betas of length T (float32).
+    """
+    steps = num_timesteps + 1
+    x = torch.linspace(0, num_timesteps, steps, dtype=torch.float32)
+    alphas_cumprod = torch.cos(((x / num_timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1. - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999).float()
+
+
+# ---------------- Positional / time encoders ----------------
+
+class SinusoidalPosEmb(nn.Module):
+    """Sine/cosine timestep embedding (float32)."""
+    def __init__(self, dim: int):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"Embedding dimension ({dim}) must be even.")
+        self.dim = dim
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        device = t.device
+        t = t.float()
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
+        pos = t.unsqueeze(-1) * emb.unsqueeze(0)
+        return torch.cat((pos.sin(), pos.cos()), dim=-1).float()
+
+
+class DDPMTimeEncoder(nn.Module):
+    """SinusoidalPosEmb + MLP for timestep embeddings."""
+    def __init__(self, embed_dim: int, activation=nn.SiLU):
+        super().__init__()
+        sine_embed_dim = embed_dim if (embed_dim % 2 == 0) else (embed_dim - 1)
+        self.pos_emb = SinusoidalPosEmb(sine_embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(sine_embed_dim, embed_dim),
+            activation(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.pos_emb(t)).float()
+
+
+# ---------------- Geometry helpers ----------------
+
+def get_distance(pos: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    if edge_index.numel() == 0:
+        return torch.empty((0,), dtype=pos.dtype, device=pos.device)
     return (pos[edge_index[0]] - pos[edge_index[1]]).norm(dim=-1)
 
 
-def merge_graphs_in_batch(batch1, batch2):
-  merge_batch = Batch.from_data_list([val for pair in zip(batch1.to_data_list(), batch2.to_data_list()) for val in pair])
-  merge_batch.graph_idx = torch.tensor(merge_batch.batch)
-  merge_batch.batch = merge_batch.batch//2
-  return merge_batch
+# ---------------- Batch merge ----------------
 
-
-class SinusoidalTimeEmbeddings(nn.Module):
+def _pick_device(*objs) -> torch.device:
     """
-    Sinusoidal Time Embedder.
-
-    Args:
-        out_dim (int): The output dimension of the embedding.
+    Pick a common device from a list of tensors/Batches.
+    Priority: first CUDA device encountered; else CPU.
     """
-    def __init__(self, out_dim):
-        super().__init__()
-        self.out_dim = out_dim
+    for o in objs:
+        if isinstance(o, torch.Tensor):
+            if o.is_cuda:
+                return o.device
+        elif isinstance(o, Batch):
+            # Try representative attribute
+            for attr in ("pos", "x", "atom_type", "edge_index"):
+                if hasattr(o, attr) and getattr(o, attr) is not None:
+                    t = getattr(o, attr)
+                    if isinstance(t, torch.Tensor) and t.is_cuda:
+                        return t.device
+    return torch.device("cpu")
 
-    def forward(self, time):
-        """
-        Args:
-            time (torch.tensor): A tensor of shaped `(num_nodes, 1)` representing time values of each node.
+def merge_graphs_in_batch(batch1: Batch, batch2: Batch, device: Optional[torch.device] = None) -> Batch:
+    """
+    Merge as [Q1,R1,Q2,R2,...] and attach graph_idx (even=query, odd=ref) and pair-level batch.
+    All Data objects are moved to `device` beforehand to avoid CPU/CUDA mixing.
+    """
+    if device is None:
+        device = _pick_device(batch1, batch2)
 
-        returns:
-            torch.tensor: A tensor of shape `(num_nodes, self.out_dim)` containing the sinusoidal time embeddings.
-        """
-        device = time.device
-        half_out_dim = self.out_dim // 2
-        embeddings = math.log(10000) / (half_out_dim - 1)
-        embeddings = torch.exp(torch.arange(half_out_dim, device=device) * -embeddings)
-        embeddings = time[:, None] * embeddings[None, :]
-        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings.squeeze(1)
+    data_list = []
+    for d1, d2 in zip(batch1.to_data_list(), batch2.to_data_list()):
+        data_list.append(d1.to(device))
+        data_list.append(d2.to(device))
+    if not data_list:
+        # empty Batch on target device
+        empty = Batch()
+        # attach empty required attrs on correct device if needed later
+        return empty
 
+    merge_batch = Batch.from_data_list(data_list)  # now all on same device
+    num_nodes_list = [d.num_nodes for d in data_list]
+
+    # graph_idx/batch on correct device
+    graph_idx_list = [torch.full((n,), i, dtype=torch.long, device=device) for i, n in enumerate(num_nodes_list)]
+    batch_idx_list = [torch.full((n,), i // 2, dtype=torch.long, device=device) for i, n in enumerate(num_nodes_list)]
+
+    merge_batch.graph_idx = torch.cat(graph_idx_list) if graph_idx_list else torch.empty(0, dtype=torch.long, device=device)
+    merge_batch.batch = torch.cat(batch_idx_list) if batch_idx_list else torch.empty(0, dtype=torch.long, device=device)
+    return merge_batch
+
+
+# ---------------- Main (Isotropic DiffAlign) ----------------
 
 class DiffAlign(nn.Module):
+    """
+    Isotropic Gaussian Diffusion (v-parameterization; T steps)
+    - Backbone: EGNN + CrossGraphAligner (only query coordinates move)
+    - Output: v_t in merged (Q,R) order
+    - Loss: v MSE + x0 anchor + optional repulsion
+    """
+    def __init__(
+        self,
+        node_feature_dim: int = 64,
+        time_embed_dim: int = 32,
+        query_embed_dim: int = 32,
+        edge_encoder_dim: int = 64,
+        gnn_hidden_dim: int = 128,
+        gnn_layers_intra: int = 12,
+        gnn_layers_intra_2: int = 4,
+        gnn_layers_inter: int = 8,
+        max_atom_types: int = 100,
 
-    def __init__(self):
+        # Diffusion
+        num_timesteps: int = 32,
+        beta_start: float = 1e-4,
+        beta_end: float = 0.02,
+        schedule_type: str = 'cosine',
+
+        # Repulsion
+        repulsion_weight: float = 1e-2,
+        repulsion_margin: float = 1.2,
+        repulsion_exclude_hops: int = 3,
+    ):
         super().__init__()
-        self.edge_encoder = MLPEdgeEncoder(128, "relu")
-        self.edge_encoder2 = MLPEdgeEncoder(128, "relu")
-        
+
+        # ---- Diffusion buffers (isotropic) ----
+        self.num_timesteps = int(num_timesteps)
+        if schedule_type == 'linear':
+            betas = linear_beta_schedule(self.num_timesteps, beta_start, beta_end)
+        elif schedule_type == 'cosine':
+            betas = cosine_beta_schedule(self.num_timesteps)
+        else:
+            raise ValueError(f"Unknown beta schedule: {schedule_type}")
+
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        self.register_buffer('sqrt_alphas', torch.sqrt(alphas))
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        self.register_buffer('posterior_variance', betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod + 1e-12))
+        self.register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod + 1e-12))
+        self.register_buffer('posterior_mean_coef2', torch.sqrt(alphas) * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod + 1e-12))
+
+        # ---- Encoders ----
+        self.edge_encoder = MLPEdgeEncoder(edge_encoder_dim, "relu")
+        self.edge_encoder2 = MLPEdgeEncoder(edge_encoder_dim, "relu")
+
         self.node_encoder = nn.Sequential(
-                            nn.Embedding(100, 64),
-                            nn.SiLU(),
-                            nn.Linear(64,64),
-                            )
-        
-        self.time_encoder = nn.Sequential(
-                            SinusoidalTimeEmbeddings(32),
-                            nn.Linear(32,32),
-                            nn.SiLU(),
-                            nn.Linear(32,32),
-                            )
-        
+            nn.Embedding(max_atom_types, node_feature_dim),
+            nn.SiLU(),
+            nn.Linear(node_feature_dim, node_feature_dim),
+        )
+        self.time_encoder = DDPMTimeEncoder(time_embed_dim, activation=nn.SiLU)
         self.query_encoder = nn.Sequential(
-                                nn.Embedding(2, 32),
-                                nn.SiLU(),
-                                nn.Linear(32,32),
-                                )
-        
-        self.encoder = EGNN(
-            in_node_nf=128, in_edge_nf=128, hidden_nf=128, device='cpu',
-            act_fn=torch.nn.SiLU(), n_layers=12, attention=True,
-            tanh=False, norm_constant=0
-            )
-
-        self.encoder2 = EGNN(
-            in_node_nf=128, in_edge_nf=128, hidden_nf=128, device='cpu',
-            act_fn=torch.nn.SiLU(), n_layers=4, attention=True,
-            tanh=False, norm_constant=0
-            )
-        
-        self.encoder_cross = EGNN(
-            in_node_nf=128, in_edge_nf=1, hidden_nf=128, device='cpu',
-            act_fn=torch.nn.SiLU(), n_layers=8, attention=True,
-            tanh=False, norm_constant=0
-            )
-
-        self.betas = nn.Parameter(torch.linspace(0.0001*1000/1000, 0.01*1000/1000, 1000), requires_grad=False)
-        self.alphas = nn.Parameter((1. - self.betas), requires_grad=False)
-        self.num_timesteps = self.betas.size(0)
-
-
-    def forward(self, query_batch, reference_batch, time_step, condition=True):
-        """
-        Args:
-            quey_batch (torch_geometric.data.Batch): A batch for query molecules containg atom_type, edge_index, edge_type, pos, and batch as attributes.
-            reference_batch (torch_geometric.data.Batch): A batch for reference molecules with the same structure as query_batch.
-            time_step (torch.tensor): A time step index vector for each node shaped `(num_batches,)`.
-            condition (bool, optional): A flag indicating whether to apply conditioning. Defaults to `True`.
-
-        Returns:
-            torch.tensor: Predicted noise of shape `(n_nodes, 3)`.
-            
-        """
-
-        merged_batch = merge_graphs_in_batch(query_batch, reference_batch)
-
-        edge_index, edge_type = extend_graph_order_radius(
-            num_nodes=merged_batch.atom_type.size(0),
-            pos=merged_batch.pos,
-            edge_index=merged_batch.edge_index,
-            edge_type=merged_batch.edge_type,
-            batch=merged_batch.graph_idx,
-            order=3,
-            cutoff=10,
-            extend_order=True,
-            extend_radius=False,
+            nn.Embedding(2, query_embed_dim),  # 0=ref, 1=query
+            nn.SiLU(),
+            nn.Linear(query_embed_dim, query_embed_dim),
         )
 
-        edge_index_2, edge_type_2 = extend_graph_order_radius(
+        gnn_in_node_dim = node_feature_dim + time_embed_dim + query_embed_dim
+
+        self.intra_encoder = EGNN(
+            in_node_nf=gnn_in_node_dim, in_edge_nf=edge_encoder_dim, hidden_nf=gnn_hidden_dim,
+            n_layers=gnn_layers_intra, attention=True
+        )
+        self.cross_aligner = CrossGraphAligner(
+            dim=gnn_hidden_dim,
+            heads=4,
+            dropout=0.1,
+            coord_update=True,
+            num_layers=gnn_layers_inter,
+            recompute_each=1,
+        )
+        self.intra_encoder_2 = EGNN(
+            in_node_nf=gnn_hidden_dim, in_edge_nf=edge_encoder_dim, hidden_nf=gnn_hidden_dim,
+            n_layers=gnn_layers_intra_2, attention=True
+        )
+
+        # Repulsion hyperparams
+        self.repulsion_weight = float(repulsion_weight)
+        self.repulsion_margin = float(repulsion_margin)
+        self.repulsion_exclude_hops = int(repulsion_exclude_hops)
+
+    # -------------- Forward: predict v_t --------------
+
+    def forward(self, query_batch: Batch, reference_batch: Batch, t: torch.Tensor,
+                condition: bool = True) -> torch.Tensor:
+        """
+        Predict v_t for merged (query, reference) batches.
+          - query_batch, reference_batch: torch_geometric.data.Batch
+          - t: [G] timesteps (0..T-1) per graph
+        """
+        merged_batch = merge_graphs_in_batch(query_batch, reference_batch)
+        if merged_batch.num_nodes == 0:
+            device_to_use = query_batch.pos.device if hasattr(query_batch, 'pos') else 'cpu'
+            return torch.zeros((0, 3), device=device_to_use)
+
+        device = merged_batch.pos.device
+        x_in = merged_batch.pos
+
+        # (A) Query mask: only query coordinates are updated
+        qmask_bool = ((merged_batch.graph_idx % 2) == 0)
+        coord_mask = qmask_bool.float().unsqueeze(-1)
+
+        # (B) Embeddings
+        node_feat = self.node_encoder(merged_batch.atom_type)
+        t_nodes = t[merged_batch.batch]  # expand per-graph timestep to nodes
+        time_emb = self.time_encoder(t_nodes)
+        is_query = ((merged_batch.graph_idx % 2) == 0).long()  # 1=query, 0=ref
+        query_emb = self.query_encoder(is_query)
+        h = torch.cat([node_feat, time_emb, query_emb], dim=-1)
+
+        # (C) Intra-graph (stage 1): update only query coords
+        edge_index, edge_type = extend_graph_order_radius(
             num_nodes=merged_batch.atom_type.size(0),
-            pos=merged_batch.pos,
+            pos=x_in,
             edge_index=merged_batch.edge_index,
             edge_type=merged_batch.edge_type,
             batch=merged_batch.graph_idx,
             order=3,
-            cutoff=10,
+            cutoff=8,
             extend_order=True,
             extend_radius=True,
         )
-        
-        edge_length = get_distance(merged_batch.pos, edge_index).unsqueeze(-1)   # (E, 1)
-        query_mask = ((merged_batch.graph_idx%2)==0)
+        edge_length = get_distance(x_in, edge_index).unsqueeze(-1)
+        e = self.edge_encoder(edge_length=edge_length, edge_type=edge_type)
 
-        # Create cross-attention-like edges to apply conditions.
-        if self.training:
-            if (torch.rand(1)<0.9).sum()==1:
-                edge_index_a = extend_to_cross_attention(merged_batch.pos, 200, merged_batch.batch, merged_batch.graph_idx)
-            else:
-                edge_index_a = extend_to_cross_attention(merged_batch.pos, 0, merged_batch.batch, merged_batch.graph_idx)
+        h, x = self.intra_encoder(
+            h=h, x=x_in, edges=edge_index, edge_attr=e,
+            coord_mask=coord_mask,
+        )
+
+        # (D) Cross (query moves)
+        if condition:
+            h, x = self.cross_aligner(h, x, batch=merged_batch.batch, graph_idx=merged_batch.graph_idx)
+
+        # (E) Intra-graph (stage 2)
+        edge_index2, edge_type2 = extend_graph_order_radius(
+            num_nodes=merged_batch.atom_type.size(0),
+            pos=x,
+            edge_index=merged_batch.edge_index,
+            edge_type=merged_batch.edge_type,
+            batch=merged_batch.graph_idx,
+            order=3,
+            cutoff=8,
+            extend_order=True,
+            extend_radius=True,
+        )
+        edge_length2 = get_distance(x, edge_index2).unsqueeze(-1)
+        e2 = self.edge_encoder2(edge_length=edge_length2, edge_type=edge_type2)
+
+        h, x = self.intra_encoder_2(
+            h=h, x=x, edges=edge_index2, edge_attr=e2,
+            coord_mask=coord_mask,
+        )
+
+        # (F) Output: v = x - x_in
+        v_hat = x - x_in
+        return v_hat
+
+    # -------------- Samplers --------------
+
+    @torch.no_grad()
+    def DDPM_Sampling_UFF(
+        self,
+        query_batch: Batch,
+        reference_batch: Batch,
+        *,
+        clamp: float = 1e-10,
+        cfg_scale: float = 1.0,
+        # ---- UFF(PyTorch) options ----
+        query_mols=None,                      # RDKit Mol list; None disables UFF
+        pocket_mols=None,                     # RDKit Mol list; None disables pocket guidance
+        uff_guidance_scale: float = 0.0,      # 0 disables UFF
+        uff_inner_steps: int = 8,             # inner gradient steps for UFF
+        uff_clamp: float = 1.0,               # clamp magnitude of forces
+        uff_start_ratio: float = 0.0,         # skip UFF if (t/(T-1)) < ratio
+        snr_gate_gamma: float = 1.0,          # gate(t) = (1 - σ_t)^γ
+        # ---- Temperature option ----
+        noise_temperature: float = 0.3,       # posterior noise temperature τ
+        # ---- UFF dynamic nonbonded params ----
+        uff_vdw_multiplier: float = 10.0,     # dynamic cutoff multiplier
+        debug_log: bool = False,
+    ):
+        """
+        Standard DDPM (v-param) + UFFTorch-based UFF steering on x0.
+        Note: _refresh_nonbond_candidates is called with ligand+pocket coords merged.
+        """
+
+        device = self.betas.device
+        qb = query_batch.to(device)
+        rb = reference_batch.to(device)
+        T = self.num_timesteps
+
+        if qb.num_nodes == 0:
+            return (torch.zeros((0, 3), device=device), None)
+
+        # ---------- UFFTorch setup ----------
+        use_uff = (
+            uff_guidance_scale > 0.0
+            and (query_mols is not None)
+            and (pocket_mols is not None)
+        )
+
+        if use_uff:
+            assert len(query_mols) == qb.num_graphs
+            assert len(pocket_mols) == qb.num_graphs
+
+            q_inputs_ref = build_uff_inputs(
+                query_mols,
+                device=device,
+                dtype=torch.float32,
+                vdw_distance_multiplier=uff_vdw_multiplier,
+                ignore_interfragment_interactions=False,
+            )
+            p_inputs_ref = build_uff_inputs(
+                pocket_mols,
+                device=device,
+                dtype=torch.float32,
+                vdw_distance_multiplier=uff_vdw_multiplier,
+                ignore_interfragment_interactions=False,
+            )
+
+            qp_inputs = merge_uff_inputs(
+                q_inputs_ref,
+                p_inputs_ref,
+                ignore_interfragment_interactions=False,
+                vdw_distance_multiplier=float(uff_vdw_multiplier),
+            )
+
+            uff_model = UFFTorch(qp_inputs).to(device).eval()
+            uff_model._vdw_distance_multiplier = float(uff_vdw_multiplier)
+
+            # 3. Query node indices
+            mol_slices_q = [
+                (qb.batch == i).nonzero(as_tuple=True)[0]
+                for i in range(qb.num_graphs)
+            ]
+            gather_idx_q = torch.cat(mol_slices_q, dim=0).to(device)
+
+            B = qb.num_graphs
+            Nq = mol_slices_q[0].numel()
+            for sl in mol_slices_q:
+                assert sl.numel() == Nq, "Ligand atom counts must match across the batch."
+
+            # 4. Freeze pocket coordinates (tensor conversion)
+            def _mol_to_coords_tensor(m):
+                conf = m.GetConformer()
+                return torch.tensor(
+                    [[conf.GetAtomPosition(k).x, conf.GetAtomPosition(k).y, conf.GetAtomPosition(k).z]
+                     for k in range(m.GetNumAtoms())],
+                    device=device, dtype=torch.float32
+                )
+
+            pocket_coords_fixed = torch.stack(
+                [_mol_to_coords_tensor(m) for m in pocket_mols], dim=0
+            )  # [B, Np, 3]
+
         else:
-            if condition:
-                edge_index_a = extend_to_cross_attention(merged_batch.pos, 200, merged_batch.batch, merged_batch.graph_idx)
+            uff_model = None
+
+        # ---------- x_T init ----------
+        x_t = torch.randn(
+            (qb.num_nodes, 3),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        # ---------- Reverse diffusion loop ----------
+        for t in reversed(range(T)):
+            t_graph = torch.full((qb.num_graphs,), t, device=device, dtype=torch.long)
+
+            # Current coords + model prediction
+            cur_q = qb.clone()
+            cur_q.pos = x_t
+
+            if cfg_scale == 1.0:
+                v_hat_merged = self(cur_q, rb, t_graph, condition=True)
             else:
-                edge_index_a = extend_to_cross_attention(merged_batch.pos, 0, merged_batch.batch, merged_batch.graph_idx)
+                v_u = self(cur_q, rb, t_graph, condition=False)
+                v_c = self(cur_q, rb, t_graph, condition=True)
+                v_hat_merged = v_u + cfg_scale * (v_c - v_u)
 
-        h = torch.cat([self.node_encoder(merged_batch.atom_type), self.time_encoder(time_step.index_select(0, merged_batch.batch).view(-1,1)), self.query_encoder(query_mask*1)], dim=1)
+            merged = merge_graphs_in_batch(cur_q, rb, device=device)
+            qmask = (merged.graph_idx % 2 == 0)
+            v_hat = v_hat_merged[qmask]
 
-        x = merged_batch.pos
+            abar_t = self.sqrt_alphas_cumprod[t]
+            sig_t  = self.sqrt_one_minus_alphas_cumprod[t]
 
-        e = self.edge_encoder(
-            edge_length=edge_length,
-            edge_type=edge_type
-        )
+            # 2) x0 prediction (reconstruction)
+            x0_pred = abar_t * x_t - sig_t * v_hat
 
-        h, x = self.encoder(
-            h = h,
-            x = x,
-            edges = edge_index,
-            edge_attr=e,
-            coord_mask=query_mask
-        ) 
+            # SNR Gate
+            sigma_t_val = float(sig_t.item())
+            h_t = 1.0 - sigma_t_val
+            h_t = max(0.0, min(1.0, h_t))
+            gate_t = h_t ** float(snr_gate_gamma)
 
-        edge_length_a = get_distance(x, edge_index_a).unsqueeze(-1)
+            # 3) UFF Guidance: x0_pred → x0_star
+            if (
+                use_uff
+                and (t / max(1, T - 1)) >= uff_start_ratio
+                and gate_t > 0.0
+            ):
+                # (1) Extract ligand coords [B, Nq, 3]
+                coords_q0 = x0_pred.index_select(0, gather_idx_q)
+                coords_q0 = coords_q0.view(B, Nq, 3).detach()
 
-        h, x = self.encoder_cross(
-            h = h,
-            x = x,
-            edges = edge_index_a,
-            edge_attr = edge_length_a,
-            coord_mask = query_mask
-        )
+                # (2) Build full coords (ligand+pocket) for neighbor refresh
+                coords_full = torch.cat([coords_q0, pocket_coords_fixed], dim=1)
 
-        edge_length_2 = get_distance(x, edge_index_2).unsqueeze(-1)
+                with torch.no_grad():
+                    uff_model._refresh_nonbond_candidates(coords_full)
 
-        e_2 = self.edge_encoder2(
-            edge_length=edge_length_2,
-            edge_type=edge_type_2
-        )
-
-        h, x = self.encoder2(
-            h = h,
-            x = x,
-            edges = edge_index_2,
-            edge_attr = e_2,
-            coord_mask=query_mask
-        )
-
-        return x[query_mask] - merged_batch.pos[query_mask]
-    
-
-    def get_loss(self, query_batch, reference_batch):
-        """
-        Args:
-            quey_batch (torch_geometric.data.Batch): A batch for query molecules containg atom_type, edge_index, edge_type, pos, and batch as attributes.
-            reference_batch (torch_geometric.data.Batch): A batch for reference molecules with the same structure as query_batch.
-
-        Returns:
-            torch.tensor: Calculated loss, a scalar tensor.
-            
-        """
-        time_step = torch.randint(0, self.num_timesteps, size=(query_batch.num_graphs, ), device=query_batch.pos.device)
-        a = self.alphas.cumprod(dim=0).index_select(0, time_step)
-        a_pos = a.index_select(0, query_batch.batch).unsqueeze(-1)  # (N, 1)
-
-        # Add noise as ddpm manner
-        pos_noise = torch.randn_like(query_batch.pos)
-        query_batch.pos = query_batch.pos * a_pos.sqrt() + pos_noise * (1.0 - a_pos).sqrt()
-        reference_batch.atom_type = reference_batch.atom_type + 35
-
-        x = self(
-            query_batch=query_batch,
-            reference_batch=reference_batch,
-            time_step = time_step,
-        )
-
-        loss =  ((x - pos_noise).square()).mean()
-        return loss
-
-
-    def DDPM_Sampling(self, query_batch, reference_batch):
-        """
-        Args:
-            quey_batch (torch_geometric.data.Batch): A batch for query molecules containg atom_type, edge_index, edge_type, pos, and batch as attributes.
-            reference_batch (torch_geometric.data.Batch): A batch for reference molecules with the same structure as query_batch.
-
-        Returns:
-            torch.tensor: Predicted position of query molecule shaped `(num_query_nodes, 3)`.
-            list[torch.tensor]: Trajectory of query molecule, contatining 999 tensors each shaped `(num_query_nodes, 3)`.
-        """
-        reference_batch.atom_type = reference_batch.atom_type + 35
-
-        pos_traj = []
-        with torch.no_grad():
-            seq = range(0, self.num_timesteps)
-            seq_next = [-1] + list(seq[:-1])
-
-            for i, j in tqdm(zip(reversed(seq[1:]), reversed(seq_next[1:])), desc='sample'):
-                t = torch.full(size=(query_batch.num_graphs,), fill_value=i, dtype=torch.long, device=query_batch.pos.device)
-                next_t = torch.full(size=(query_batch.num_graphs,), fill_value=j, dtype=torch.long, device=query_batch.pos.device)
-
-                x = self(
-                    query_batch=query_batch,
-                    reference_batch=reference_batch,
-                    time_step=t,
-                    condition=True,
-                )
-
-                eps_pos = x
+                # (3) Gradient descent loop
+                coords_q = coords_q0.clone()
+                inner = max(1, int(uff_inner_steps))
+                step_scale = (uff_guidance_scale * gate_t) / float(inner)
                 
-                at = self.alphas.cumprod(dim=0).index_select(0, t[0])
-                at_next = self.alphas.cumprod(dim=0).index_select(0, next_t[0])
+                with torch.enable_grad():
+                    for _ in range(inner):
+                        coords_q_req = coords_q.clone().requires_grad_(True)
+                        
+                        # Concatenate for energy; ligand needs grads, pocket stays fixed
+                        coords_cat = torch.cat([coords_q_req, pocket_coords_fixed], dim=1)
 
-                e = eps_pos
+                        E_b = uff_model(coords_cat)
+                        
+                        if not isinstance(E_b, torch.Tensor):
+                            E_b = torch.as_tensor(E_b, device=device, dtype=coords_cat.dtype)
+                        if E_b.ndim == 0:
+                            E_b = E_b.unsqueeze(0)
 
-                # Denoising as DDPM manner
-                x0_pred = (query_batch.pos - e*(1-at).sqrt()) / at.sqrt()
-                sigma_t = ((1-at_next)/(1-at)*(1-(at/at_next))).sqrt()
-                pos_next = at_next.sqrt()*x0_pred + (1-at_next-sigma_t.square()).sqrt()*e + sigma_t*torch.randn_like(query_batch.pos)
+                        grad_q, = autograd.grad(E_b.sum(), coords_q_req, create_graph=False)
+                        
+                        forces_q = (-grad_q).detach().clamp_(-uff_clamp, uff_clamp)
+                        coords_q = (coords_q + step_scale * forces_q).detach()
 
-                query_batch.pos = pos_next
+                # (4) Apply refined coords to x0_star
+                x0_star = x0_pred.clone()
+                x0_star.index_copy_(0, gather_idx_q, coords_q.reshape(B * Nq, 3))
 
-                if torch.isnan(query_batch.pos).any():
-                    print('NaN detected. Please restart.')
-                    raise FloatingPointError()
+                if debug_log:
+                    f_norm = forces_q.norm(dim=-1)
+                    print(f"[UFF] t={t:02d} | Force Mean={f_norm.mean():.3f}")
+
+            else:
+                x0_star = x0_pred
+
+            # 4) Posterior Mean (Standard DDPM)
+            # mu_t = c1 * x0_star + c2 * x_t
+            c1_t = self.posterior_mean_coef1[t]
+            c2_t = self.posterior_mean_coef2[t]
+            x_mean = c1_t * x0_star + c2_t * x_t
+
+            # 5) Noise Addition
+            if t > 0:
+                var_t = self.posterior_variance[t]
+                if noise_temperature != 1.0:
+                    var_t = (noise_temperature ** 2) * var_t
+                var_t = max(float(var_t), 1e-20)
                 
-                pos_traj.append(query_batch.pos.clone().cpu())
-            
-        return query_batch.pos, pos_traj
-    
-    def DDPM_CFG_Sampling(self, query_batch, reference_batch):
-        """
-        Args:
-            quey_batch (torch_geometric.data.Batch): A batch for query molecules containg atom_type, edge_index, edge_type, pos, and batch as attributes.
-            reference_batch (torch_geometric.data.Batch): A batch for reference molecules with the same structure as query_batch.
+                noise = torch.randn_like(x_t)
+                x_t = x_mean + math.sqrt(var_t) * noise
+            else:
+                x_t = x_mean
 
-        Returns:
-            torch.tensor: Predicted position of query molecule shaped `(num_query_nodes, 3)`.
-            list[torch.tensor]: Trajectory of query molecule, contatining 999 tensors each shaped `(num_query_nodes, 3)`.
-        """
-        reference_batch.atom_type = reference_batch.atom_type + 35
-
-        pos_traj = []
-        with torch.no_grad():
-            seq = range(0, self.num_timesteps)
-            seq_next = [-1] + list(seq[:-1])
-
-            for i, j in tqdm(zip(reversed(seq[1:]), reversed(seq_next[1:]))):
-                t = torch.full(size=(query_batch.num_graphs,), fill_value=i, dtype=torch.long, device=query_batch.pos.device)
-                next_t = torch.full(size=(query_batch.num_graphs,), fill_value=j, dtype=torch.long, device=query_batch.pos.device)
-
-                x_g = self(
-                    query_batch=query_batch,
-                    reference_batch=reference_batch,
-                    time_step = t,
-                    condition=True
-                )
-
-                x_f = self(
-                    query_batch=query_batch,
-                    reference_batch=reference_batch,
-                    time_step = t,
-                    condition=False
-                )
-
-                eps_pos = 10*x_g - 9*x_f
-
-                at = self.alphas.cumprod(dim=0).index_select(0, t[0])
-                at_next = self.alphas.cumprod(dim=0).index_select(0, next_t[0])
-
-                e = eps_pos
-
-                # Denoising as DDPM manner
-                x0_pred = (query_batch.pos - e*(1-at).sqrt()) / at.sqrt()
-                sigma_t = ((1-at_next)/(1-at)*(1-(at/at_next))).sqrt()
-                pos_next = at_next.sqrt()*x0_pred + (1-at_next-sigma_t.square()).sqrt()*e + sigma_t*torch.randn_like(query_batch.pos)
-
-                query_batch.pos = pos_next
-
-                if torch.isnan(query_batch.pos).any():
-                    print('NaN detected. Please restart.')
-                    raise FloatingPointError()
-
-                pos_traj.append(query_batch.pos.clone().cpu())
-            
-        return query_batch.pos, pos_traj
-
-    def DDIM_CFG_Sampling(self, query_batch, reference_batch, n_steps):
-        """
-        Args:
-            quey_batch (torch_geometric.data.Batch): A batch for query molecules containg atom_type, edge_index, edge_type, pos, and batch as attributes.
-            reference_batch (torch_geometric.data.Batch): A batch for reference molecules with the same structure as query_batch.
-            n_steps (int): A number of steps for DDIM sampling.
-
-        Returns:
-            torch.tensor: Predicted position of query molecule shaped `(num_query_nodes, 3)`.
-            list[torch.tensor]: Trajectory of query molecule, contatining 999 tensors each shaped `(num_query_nodes, 3)`.
-        """
-        reference_batch.atom_type = reference_batch.atom_type + 35
-
-        pos_traj = []
-        with torch.no_grad():
-
-            t_max = self.num_timesteps - 1
-            seq = torch.linspace(0, 1, n_steps) * t_max
-            seq_prev = torch.cat([torch.tensor([-1]), seq[:-1]], dim=0)
-            timesteps = reversed(seq[1:])
-            timesteps_prev = reversed(seq_prev[1:])
-
-            for i, j in tqdm(zip(timesteps, timesteps_prev), desc='sample'):
-                t = torch.full(size=(query_batch.num_graphs,), fill_value=i, dtype=torch.long, device=query_batch.pos.device)
-                next_t = torch.full(size=(query_batch.num_graphs,), fill_value=j, dtype=torch.long, device=query_batch.pos.device)
-
-                x_g = self(
-                    query_batch=query_batch,
-                    reference_batch=reference_batch,
-                    time_step = t,
-                    condition=True
-                )
-
-                x_f = self(
-                    query_batch=query_batch,
-                    reference_batch=reference_batch,
-                    time_step = t,
-                    condition=False
-                )
-
-                eps_pos = 10*x_g - 9*x_f
-
-                at = self.alphas.cumprod(dim=0).index_select(0, t[0])
-                at_next = self.alphas.cumprod(dim=0).index_select(0, next_t[0])
-
-                e = eps_pos
-
-                # Denoising as DDIM manner
-                x0_pred = (query_batch.pos - e*(1-at).sqrt()) / at.sqrt()
-                pos_next = at_next.sqrt()*x0_pred + (1-at_next).sqrt()*e
-
-                query_batch.pos = pos_next
-
-                if torch.isnan(query_batch.pos).any():
-                    print('NaN detected. Please restart.')
-                    raise FloatingPointError()
-                pos_traj.append(query_batch.pos.clone().cpu())
-            
-        return query_batch.pos, pos_traj
+        return (x_t, None)
